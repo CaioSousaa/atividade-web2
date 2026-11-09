@@ -1,0 +1,87 @@
+name: CI - migrations, Docker e API
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Variáveis cadastradas no GitHub:
+    #   Settings > Secrets and variables > Actions
+    #   - Secrets:   POSTGRES_PASSWORD
+    #   - Variables: POSTGRES_USER, POSTGRES_DB
+    env:
+      POSTGRES_USER: ${{ vars.POSTGRES_USER }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+      POSTGRES_DB: ${{ vars.POSTGRES_DB }}
+      DATABASE_URL: postgresql://${{ vars.POSTGRES_USER }}:${{ secrets.POSTGRES_PASSWORD }}@localhost:5432/${{ vars.POSTGRES_DB }}?schema=public
+      API_URL: http://localhost:3000
+
+    # Container do banco: existe só enquanto o job roda (alguns minutos).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ${{ vars.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ vars.POSTGRES_DB }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verificar variáveis de ambiente
+        run: |
+          for v in POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB; do
+            if [ -z "${!v}" ]; then
+              echo "::error::$v não cadastrada em Settings > Secrets and variables > Actions"
+              exit 1
+            fi
+          done
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build da imagem Docker
+        run: docker build -t web2-loja-api:${{ github.sha }} .
+
+      # O container aplica as migrations (prisma migrate deploy) ao iniciar.
+      - name: Subir API em container (aplica migrations)
+        run: |
+          docker run -d --name api --network host \
+            -e DATABASE_URL="$DATABASE_URL" \
+            web2-loja-api:${{ github.sha }}
+          for i in $(seq 1 30); do
+            if curl -fs "$API_URL/health"; then echo; exit 0; fi
+            sleep 2
+          done
+          docker logs api
+          exit 1
+
+      - name: Status das migrations
+        run: npx prisma migrate status
+
+      - name: Popular banco (seed)
+        run: npx prisma db seed
+
+      - name: Testes de estrutura, dados e API
+        run: npm test
+
+      - name: Logs do container
+        if: always()
+        run: docker logs api || true
